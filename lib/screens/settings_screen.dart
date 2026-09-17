@@ -1,0 +1,887 @@
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import '../services/vm_platform.dart';
+import '../theme.dart';
+
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  // shared_preferences v2+ automatically prepends "flutter." to every key,
+  // so use bare key names here — they are stored as "flutter.vcpu_count" etc.,
+  // which is what VmManager.kt reads from FlutterSharedPreferences.
+  static const _kVcpu      = 'vcpu_count';
+  static const _kRam       = 'ram_mb';
+  static const _kDisk      = 'disk_gb';
+  static const _kSdcardPath = 'sdcard_path';
+
+  // Default shared folder when the user has never picked one.
+  // Matches the value VmManager.kt falls back to when no pref is set.
+  static const _defaultSdcardPath = '/storage/emulated/0/LinxrShare';
+
+  DeviceInfo? _device;
+  int? _vcpu;   // null = auto
+  int? _ramMb;  // null = auto
+  int? _diskGb; // null = auto
+  String _sdcardPath = _defaultSdcardPath;
+  final TextEditingController _customPathController = TextEditingController();
+  bool _loaded = false;
+  bool _resetting = false;
+  bool _restarting = false;
+  String? _loadError;
+  String _version = '';
+
+  // ── Derived ranges from device info ────────────────────────────────────────
+
+  int get _maxVcpu => _device?.cores ?? 4;
+
+  // Total RAM rounded down to nearest 512 MB step, min 512
+  int get _maxRamMb {
+    final total = _device?.totalRamMb ?? 4096;
+    return max(512, (total ~/ 512) * 512);
+  }
+
+  // Free storage minus 2 GB headroom, min 8
+  int get _maxDiskGb {
+    final free = _device?.freeStorageGb ?? 32;
+    return max(8, free - 2);
+  }
+
+  // Auto defaults — mirrors VmManager.kt logic
+  int get _autoVcpu => max(1, (_device?.cores ?? 4) ~/ 2);
+  int get _autoRamMb {
+    final total = _device?.totalRamMb ?? 4096;
+    return max(512, total ~/ 4);
+  }
+  int get _autoDiskGb => _maxDiskGb;
+
+  // Effective displayed values (user setting or auto default)
+  int get _effectiveVcpu   => _vcpu   ?? _autoVcpu;
+  int get _effectiveRamMb  => _ramMb  ?? _autoRamMb;
+  int get _effectiveDiskGb => _diskGb ?? _autoDiskGb;
+
+  // ── Lifecycle ───────────────────────────────────────────────────────────────
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _customPathController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    try {
+      final results = await Future.wait([
+        VmPlatform.getDeviceInfo(),
+        SharedPreferences.getInstance(),
+        PackageInfo.fromPlatform(),
+      ]);
+      if (!mounted) return;
+      final device = results[0] as DeviceInfo;
+      final prefs  = results[1] as SharedPreferences;
+      final pkg    = results[2] as PackageInfo;
+      setState(() {
+        _device = device;
+        _version = pkg.version;
+        int? getIntSafe(String key) {
+          final val = prefs.get(key);
+          if (val is int) return val;
+          if (val is String) return int.tryParse(val);
+          if (val is double) return val.toInt();
+          return null;
+        }
+        final v = getIntSafe(_kVcpu);
+        final r = getIntSafe(_kRam);
+        final d = getIntSafe(_kDisk);
+        _vcpu   = (v != null && v > 0) ? v : null;
+        _ramMb  = (r != null && r > 0) ? r : null;
+        _diskGb = (d != null && d > 0) ? d : null;
+        _sdcardPath = prefs.getString(_kSdcardPath) ?? _defaultSdcardPath;
+        // Seed the custom-path field only when the current path doesn't match
+        // one of the quick options, so the field starts empty for quick picks.
+        if (!_isQuickPath(_sdcardPath)) {
+          _customPathController.text = _sdcardPath;
+        }
+        _loaded = true;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadError = e.toString();
+        _loaded = true;
+      });
+    }
+  }
+
+  // ── Persist ─────────────────────────────────────────────────────────────────
+
+  Future<void> _saveVcpu(int? value) async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() => _vcpu = value);
+    if (value == null) await prefs.remove(_kVcpu);
+    else await prefs.setInt(_kVcpu, value);
+  }
+
+  Future<void> _saveRam(int? value) async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() => _ramMb = value);
+    if (value == null) await prefs.remove(_kRam);
+    else await prefs.setInt(_kRam, value);
+  }
+
+  Future<void> _saveDisk(int? value, BuildContext context) async {
+    final oldValue = _diskGb;
+    final prefs = await SharedPreferences.getInstance();
+    setState(() => _diskGb = value);
+    if (value == null) await prefs.remove(_kDisk);
+    else await prefs.setInt(_kDisk, value);
+
+    // If the disk size actually changed, remind the user to reset storage.
+    if (oldValue != value && mounted) {
+      final vm = context.read<VmState>();
+      final needsReset = vm.status != 'stopped' ||
+          await VmPlatform.getVmStatus() != 'stopped';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Disk size changed to ${value ?? _autoDiskGb} GB. '
+            'Reset VM Storage to apply.',
+          ),
+          duration: const Duration(seconds: 6),
+          action: SnackBarAction(
+            label: 'Reset',
+            textColor: AppColors.danger,
+            onPressed: () => _resetStorage(vm),
+          ),
+        ),
+      );
+    }
+  }
+
+  // ── Shared folder persistence ──────────────────────────────────────────────
+
+  /// Quick-pick locations offered to the user. Paths are absolute and rooted at
+  /// `/storage/emulated/0/` (the app's external-storage view under
+  /// MANAGE_EXTERNAL_STORAGE). `LinxrShare` is the default created by the app.
+  static const _quickSdcardOptions = <(String, String)>[
+    ('Downloads',  '/storage/emulated/0/Download'),
+    ('Documents',  '/storage/emulated/0/Documents'),
+    ('DCIM',       '/storage/emulated/0/DCIM'),
+    ('LinxrShare', '/storage/emulated/0/LinxrShare'),
+  ];
+
+  static bool _isQuickPath(String path) {
+    for (final (_, p) in _quickSdcardOptions) {
+      if (path == p) return true;
+    }
+    return false;
+  }
+
+  /// Returns true when [path] matches one of the quick options or the default.
+  /// Used to decide which chip is highlighted as currently selected.
+  bool _isPathSelected(String path) => _sdcardPath == path;
+
+  Future<void> _saveSdcardPath(String value, {bool showSnack = true}) async {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty || trimmed == _sdcardPath) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    setState(() => _sdcardPath = trimmed);
+    await prefs.setString(_kSdcardPath, trimmed);
+
+    if (showSnack && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Shared folder will apply on next VM start'),
+          duration: Duration(seconds: 4),
+        ),
+      );
+    }
+  }
+
+  Future<void> _pickFolder() async {
+    try {
+      final channel = MethodChannel('com.ai2th.linxr/vm');
+      final String? path = await channel.invokeMethod<String>('pickFolder');
+      if (path != null && path.isNotEmpty) {
+        _customPathController.text = path;
+        await _saveSdcardPath(path);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not open system file manager: $e')),
+        );
+      }
+    }
+  }
+
+  // ── Actions ─────────────────────────────────────────────────────────────────
+
+  Future<void> _restartVm(VmState vm) async {
+    setState(() => _restarting = true);
+    try {
+      await vm.stopVm();
+      await Future.delayed(const Duration(seconds: 1));
+      await vm.startVm();
+    } finally {
+      if (mounted) setState(() => _restarting = false);
+    }
+  }
+
+  Future<void> _resetStorage(VmState vm) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text('Reset VM Storage?',
+            style: TextStyle(color: Colors.white)),
+        content: const Text(
+          'This stops the VM and deletes the virtual disk.\n\n'
+          'All installed packages and files will be lost. '
+          'The new disk will be created with your current Disk Cap setting.',
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.danger),
+            child: const Text('Reset'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    setState(() => _resetting = true);
+    try {
+      await VmPlatform.resetStorage();
+      // resetStorage stops the VM on the native side; update state
+      await vm.refreshStatus();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Storage reset — start the VM to apply the new disk size'),
+            backgroundColor: AppColors.secondary,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Reset failed: $e'),
+              backgroundColor: AppColors.danger),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _resetting = false);
+    }
+  }
+
+  // ── Build ────────────────────────────────────────────────────────────────────
+
+  @override
+  Widget build(BuildContext context) {
+    final vm = context.watch<VmState>();
+    final vmRunning = vm.isRunning || vm.isBooting;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings'), centerTitle: false),
+      body: !_loaded
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                // ── App Logo & Info Header ───────────────────────────────────
+                const SizedBox(height: 8),
+                Center(
+                  child: Image.asset(
+                    'assets/ai2th_logo.png',
+                    width: 220,
+                    filterQuality: FilterQuality.high,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Center(
+                  child: Text(
+                    'Linxr VM Manager ${_version.isNotEmpty ? "v$_version" : ""}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Center(
+                  child: Text(
+                    'root@localhost:2222  ·  pw: alpine',
+                    style: TextStyle(
+                      color: Colors.white38,
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+
+                // ── Load error banner ────────────────────────────────────────
+                if (_loadError != null) ...[
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: AppColors.danger.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: AppColors.danger.withOpacity(0.4)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.error_outline, color: AppColors.danger, size: 18),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            'Failed to load settings: $_loadError',
+                            style: const TextStyle(color: AppColors.danger, fontSize: 13),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+
+                // ── VM running banner ─────────────────────────────────────────
+                if (vmRunning) ...[
+                  _RestartBanner(
+                    restarting: _restarting,
+                    onRestart: () => _restartVm(vm),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+
+                _SectionHeader('VM Resources'),
+                const SizedBox(height: 8),
+
+                // ── vCPU ──────────────────────────────────────────────────────
+                _SettingCard(
+                  icon: Icons.developer_board,
+                  iconColor: AppColors.primary,
+                  title: 'vCPU Cores',
+                  isAuto: _vcpu == null,
+                  valueLabel: _vcpu == null
+                      ? 'Auto — $_autoVcpu vCPUs (device has $_maxVcpu cores)'
+                      : '$_effectiveVcpu vCPUs assigned (device has $_maxVcpu cores)',
+                  onClearAuto: () => _saveVcpu(null),
+                  child: _IntSlider(
+                    value: _effectiveVcpu.clamp(1, _maxVcpu),
+                    min: 1,
+                    max: _maxVcpu,
+                    onChanged: (v) => _saveVcpu(v),
+                    labelSuffix: 'core',
+                    labelSuffixPlural: 'cores',
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // ── RAM ───────────────────────────────────────────────────────
+                _SettingCard(
+                  icon: Icons.memory,
+                  iconColor: AppColors.secondary,
+                  title: 'RAM',
+                  isAuto: _ramMb == null,
+                  valueLabel: _ramMb == null
+                      ? 'Auto — ${_fmtMb(_autoRamMb)} assigned to VM (device has ${_fmtMb(_maxRamMb)})'
+                      : '${_fmtMb(_effectiveRamMb)} assigned to VM (device has ${_fmtMb(_maxRamMb)})',
+                  onClearAuto: () => _saveRam(null),
+                  child: _StepSlider(
+                    value: _effectiveRamMb.clamp(512, _maxRamMb),
+                    min: 512,
+                    max: _maxRamMb,
+                    step: 512,
+                    onChanged: (v) => _saveRam(v),
+                    labelFn: _fmtMb,
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // ── Disk ──────────────────────────────────────────────────────
+                _SettingCard(
+                  icon: Icons.storage,
+                  iconColor: AppColors.warning,
+                  title: 'Disk Cap',
+                  isAuto: _diskGb == null,
+                  valueLabel: _diskGb == null
+                      ? 'Auto — $_autoDiskGb GB virtual disk (${_device?.freeStorageGb ?? 32} GB free on device)'
+                      : '$_effectiveDiskGb GB virtual disk (${_device?.freeStorageGb ?? 32} GB free on device)',
+                  onClearAuto: () => _saveDisk(null, context),
+                  child: _StepSlider(
+                    value: _effectiveDiskGb.clamp(8, _maxDiskGb),
+                    min: 8,
+                    max: _maxDiskGb,
+                    step: 1,
+                    onChanged: (v) => _saveDisk(v, context),
+                    labelFn: (v) => '$v GB',
+                  ),
+                ),
+                const SizedBox(height: 8),
+                _ResetStorageButton(
+                  resetting: _resetting,
+                  onReset: () => _resetStorage(vm),
+                ),
+
+                const SizedBox(height: 24),
+                _SectionHeader('Shared Folder (virtio-9p)'),
+                const SizedBox(height: 8),
+                _SettingCard(
+                  icon: Icons.folder_shared,
+                  iconColor: AppColors.primary,
+                  title: 'Shared Folder',
+                  isAuto: false,
+                  valueLabel: _sdcardPath,
+                  onClearAuto: () {},
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final (label, path) in _quickSdcardOptions)
+                            ChoiceChip(
+                              label: Text(label),
+                              selected: _isPathSelected(path),
+                              onSelected: (_) {
+                                _customPathController.text = '';
+                                _saveSdcardPath(path);
+                              },
+                            ),
+                          ChoiceChip(
+                            label: const Text('Custom'),
+                            selected: !_isQuickPath(_sdcardPath),
+                            onSelected: (_) {
+                              // Focus the text field by triggering a rebuild
+                              // via setState, then focus its FocusNode if
+                              // attached. We just refocus after the rebuild.
+                              setState(() {});
+                            },
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      ElevatedButton.icon(
+                        onPressed: _pickFolder,
+                        icon: const Icon(Icons.folder_open, size: 18),
+                        label: const Text('Open System File Manager'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primary,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _customPathController,
+                        style: const TextStyle(
+                            color: Colors.white, fontSize: 13),
+                        decoration: InputDecoration(
+                          isDense: true,
+                          hintText: '/storage/emulated/0/MyFolder',
+                          hintStyle: const TextStyle(
+                              color: Colors.white24, fontSize: 13),
+                          filled: true,
+                          fillColor: Colors.black26,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(6),
+                            borderSide: BorderSide.none,
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 10),
+                          suffixIcon: TextButton(
+                            onPressed: () => _saveSdcardPath(
+                                _customPathController.text),
+                            child: const Text('Set',
+                                style: TextStyle(
+                                    color: AppColors.primary,
+                                    fontSize: 12)),
+                          ),
+                        ),
+                        onSubmitted: (v) => _saveSdcardPath(v),
+                      ),
+                      const SizedBox(height: 6),
+                      const Text(
+                        'Available to the VM at /mnt/sdcard. Requires '
+                        'MANAGE_EXTERNAL_STORAGE.',
+                        style: TextStyle(color: Colors.white38, fontSize: 11),
+                      ),
+                    ],
+                  ),
+                ),
+
+                const SizedBox(height: 24),
+                _SectionHeader('When changes apply'),
+                const SizedBox(height: 8),
+                Card(
+                  color: AppColors.surface,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: const [
+                        _ChangeRow(Icons.play_arrow, 'vCPU & RAM',
+                            'Next VM start'),
+                        SizedBox(height: 8),
+                        _ChangeRow(Icons.warning_amber_rounded, 'Disk Cap',
+                            'After "Reset VM Storage" (clears all installed packages)'),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 32),
+              ],
+            ),
+    );
+  }
+
+  static String _fmtMb(int mb) {
+    if (mb < 1024) return '${mb}MB';
+    if (mb % 1024 == 0) return '${mb ~/ 1024}GB';
+    return '${(mb / 1024).toStringAsFixed(1)}GB';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Banner shown when VM is running
+// ---------------------------------------------------------------------------
+
+class _RestartBanner extends StatelessWidget {
+  const _RestartBanner({required this.restarting, required this.onRestart});
+  final bool restarting;
+  final VoidCallback onRestart;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: AppColors.warning.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppColors.warning.withOpacity(0.4)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.info_outline, color: AppColors.warning, size: 18),
+          const SizedBox(width: 10),
+          const Expanded(
+            child: Text(
+              'VM is running — restart to apply changes',
+              style: TextStyle(color: AppColors.warning, fontSize: 13),
+            ),
+          ),
+          const SizedBox(width: 8),
+          restarting
+              ? SizedBox(
+                  width: 18, height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2,
+                      color: AppColors.warning))
+              : TextButton(
+                  onPressed: onRestart,
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    foregroundColor: AppColors.warning,
+                  ),
+                  child: const Text('Restart', style: TextStyle(fontSize: 12)),
+                ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reset storage button
+// ---------------------------------------------------------------------------
+
+class _ResetStorageButton extends StatelessWidget {
+  const _ResetStorageButton({required this.resetting, required this.onReset});
+  final bool resetting;
+  final VoidCallback onReset;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerRight,
+      child: resetting
+          ? const Padding(
+              padding: EdgeInsets.symmetric(vertical: 6),
+              child: SizedBox(
+                width: 16, height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            )
+          : TextButton.icon(
+              onPressed: onReset,
+              icon: const Icon(Icons.delete_forever, size: 15,
+                  color: AppColors.danger),
+              label: const Text('Reset VM Storage',
+                  style: TextStyle(color: AppColors.danger, fontSize: 12)),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Slider widgets
+// ---------------------------------------------------------------------------
+
+class _IntSlider extends StatelessWidget {
+  const _IntSlider({
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.onChanged,
+    required this.labelSuffix,
+    required this.labelSuffixPlural,
+  });
+
+  final int value;
+  final int min;
+  final int max;
+  final ValueChanged<int> onChanged;
+  final String labelSuffix;
+  final String labelSuffixPlural;
+
+  @override
+  Widget build(BuildContext context) {
+    final divisions = max - min;
+    return Column(
+      children: [
+        Slider(
+          value: value.toDouble(),
+          min: min.toDouble(),
+          max: max.toDouble(),
+          divisions: divisions > 0 ? divisions : 1,
+          label: '$value ${value == 1 ? labelSuffix : labelSuffixPlural}',
+          onChanged: (v) => onChanged(v.round()),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              _tickLabel('$min'),
+              _tickLabel('$max'),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StepSlider extends StatelessWidget {
+  const _StepSlider({
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.step,
+    required this.onChanged,
+    required this.labelFn,
+  });
+
+  final int value;
+  final int min;
+  final int max;
+  final int step;
+  final ValueChanged<int> onChanged;
+  final String Function(int) labelFn;
+
+  @override
+  Widget build(BuildContext context) {
+    final steps = (max - min) ~/ step;
+    final sliderVal = ((value - min) / step).roundToDouble().clamp(0.0, steps.toDouble());
+    return Column(
+      children: [
+        Slider(
+          value: sliderVal,
+          min: 0,
+          max: steps.toDouble(),
+          divisions: steps > 0 ? steps : 1,
+          label: labelFn(min + sliderVal.round() * step),
+          onChanged: (v) => onChanged(min + v.round() * step),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              _tickLabel(labelFn(min)),
+              if (steps >= 2) _tickLabel(labelFn(min + (steps ~/ 2) * step)),
+              if (steps > 0 && max != min) _tickLabel(labelFn(max)),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+Widget _tickLabel(String text) => Text(
+      text,
+      style: const TextStyle(color: Colors.white24, fontSize: 10),
+    );
+
+// ---------------------------------------------------------------------------
+// Layout helpers
+// ---------------------------------------------------------------------------
+
+class _SectionHeader extends StatelessWidget {
+  const _SectionHeader(this.text);
+  final String text;
+
+  @override
+  Widget build(BuildContext context) => Text(
+        text.toUpperCase(),
+        style: const TextStyle(
+          color: Colors.white38,
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
+          letterSpacing: 1.0,
+        ),
+      );
+}
+
+class _SettingCard extends StatelessWidget {
+  const _SettingCard({
+    required this.icon,
+    required this.iconColor,
+    required this.title,
+    required this.isAuto,
+    required this.valueLabel,
+    required this.onClearAuto,
+    required this.child,
+    this.note,
+  });
+
+  final IconData icon;
+  final Color iconColor;
+  final String title;
+  final bool isAuto;
+  final String valueLabel;
+  final VoidCallback onClearAuto;
+  final Widget child;
+  final String? note;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      color: AppColors.surface,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(icon, color: iconColor, size: 18),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(title,
+                      style: const TextStyle(
+                          color: Colors.white, fontWeight: FontWeight.w600)),
+                ),
+                if (!isAuto)
+                  TextButton(
+                    onPressed: onClearAuto,
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    child: const Text('Auto',
+                        style: TextStyle(
+                            color: AppColors.primary, fontSize: 12)),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 2),
+            Text(
+              valueLabel,
+              style: TextStyle(
+                color: isAuto ? AppColors.secondary : Colors.white54,
+                fontSize: 12,
+              ),
+            ),
+            const SizedBox(height: 4),
+            child,
+            if (note != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 4, bottom: 4),
+                child: Text(note!,
+                    style: const TextStyle(
+                        color: AppColors.warning, fontSize: 11)),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ChangeRow extends StatelessWidget {
+  const _ChangeRow(this.icon, this.label, this.desc);
+  final IconData icon;
+  final String label;
+  final String desc;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 14, color: Colors.white38),
+        const SizedBox(width: 8),
+        Expanded(
+          child: RichText(
+            text: TextSpan(
+              style: const TextStyle(fontSize: 12, height: 1.4),
+              children: [
+                TextSpan(
+                    text: '$label  ',
+                    style: const TextStyle(
+                        color: Colors.white70,
+                        fontWeight: FontWeight.w600)),
+                TextSpan(
+                    text: desc,
+                    style: const TextStyle(color: Colors.white38)),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
